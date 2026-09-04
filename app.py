@@ -2,8 +2,7 @@ import streamlit as st
 from io import BytesIO
 from PIL import Image
 import numpy as np
-import easyocr
-
+from services.ocr import extract_text
 from services.extraction import extract_declarations
 from services.compliance import check_compliance
 
@@ -330,22 +329,6 @@ div.stButton > button[kind="primary"]:hover {
 </style>
 """, unsafe_allow_html=True)
 
-@st.cache_resource
-def get_ocr_reader():
-    return easyocr.Reader(["en"], gpu=False)
-
-def run_ocr(image_file):
-    image = Image.open(BytesIO(image_file.getvalue())).convert("RGB")
-    results = get_ocr_reader().readtext(np.array(image), detail=1)
-    extracted = []
-    for result in results:
-        if len(result) < 3:
-            continue
-        text, confidence = str(result[1]).strip(), float(result[2])
-        if text and confidence >= 0.25:
-            extracted.append({"text": text, "confidence": round(confidence, 3)})
-    return extracted
-
 if "page" not in st.session_state:
     st.session_state.page = "home"
 if "consumer_scan_started" not in st.session_state:
@@ -522,12 +505,32 @@ def consumer_page():
     if not evidence_files: st.warning("Please capture or upload a package image first."); return
     st.markdown('<div class="section-heading">🧠 Package Analysis</div><div class="section-line"></div>', unsafe_allow_html=True)
     with st.spinner("Reading package text with OCR..."):
-        ocr_results=[]
-        for image_file in evidence_files: ocr_results.extend(run_ocr(image_file))
-    st.success(f"EasyOCR completed — {len(ocr_results)} text elements detected.")
+        ocr_results = []
+        for image_file in evidence_files:
+            ocr_results.extend(
+                extract_text(
+                    Image.open(
+                        BytesIO(image_file.getvalue())
+                    ).convert("RGB")
+                )
+            )
+
+    st.success(
+        f"EasyOCR completed — {len(ocr_results)} evidence elements detected."
+    )
     declarations=extract_declarations(ocr_results)
     compliance_result=check_compliance(declarations)
     render_declarations(declarations)
+
+    # Development diagnostic: proves what the extraction layer actually
+    # receives from services/ocr.py. Remove or hide for final deployment.
+    with st.expander("🧪 OCR Engine Debug (Development)"):
+        for i, item in enumerate(ocr_results):
+            st.write(
+                f"{i + 1}. {item.get('text', '')} | "
+                f"confidence={item.get('confidence', 0):.3f} | "
+                f"source={item.get('source', 'unknown')}"
+            )
     render_compliance(compliance_result)
     st.markdown('<div class="section-heading">🔎 OCR Evidence</div><div class="section-line"></div>', unsafe_allow_html=True)
     with st.expander("View Raw OCR Text"):
