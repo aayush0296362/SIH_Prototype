@@ -283,6 +283,43 @@ CONSUMER_LABELS = [
     "feedback",
 ]
 
+# FSSAI licence labels. OCR may damage FSSAI into forms such as fsai/fssal.
+FSSAI_LABELS = [
+    "fssai",
+    "fssal",
+    "fsai",
+    "fssai license",
+    "fssai licence",
+    "license no",
+    "licence no",
+    "lic no",
+    "lic. no",
+]
+
+# Food-label section labels. These are used only to locate evidence;
+# the original OCR text is preserved as the returned value.
+INGREDIENT_LABELS = [
+    "ingredients",
+    "ingredient",
+]
+
+NUTRITION_LABELS = [
+    "nutrition information",
+    "nutritional information",
+    "nutrition facts",
+    "nutritional facts",
+    "nutrition",
+]
+
+VEG_NONVEG_LABELS = [
+    "vegetarian",
+    "non vegetarian",
+    "non-vegetarian",
+    "veg",
+    "non veg",
+    "non-veg",
+]
+
 NON_VALUE_WORDS = {
     "mrp",
     "batch",
@@ -1983,6 +2020,515 @@ def extract_best_before(lines):
 
 
 # ============================================================
+# FSSAI LICENCE NUMBER
+# ============================================================
+
+def _extract_14_digit_number(value):
+    """Return a plausible 14-digit FSSAI licence number from OCR text."""
+    if not value:
+        return None
+    digits = re.sub(r"\D", "", str(value))
+    return digits if len(digits) == 14 else None
+
+
+def extract_fssai_license_number(lines):
+    """Extract a 14-digit FSSAI licence number using nearby FSSAI evidence."""
+    candidates = []
+
+    for i, line in enumerate(lines):
+        text = clean_text(line.get("text", ""))
+        low = normalize_for_match(text)
+        if not text:
+            continue
+
+        has_context = (
+            has_label(text, FSSAI_LABELS)
+            or bool(re.search(r"\bfssai\b|\bfssal\b|\bfsai\b", low, re.I))
+            or bool(re.search(r"\b(?:lic|license|licence)\b", low, re.I))
+        )
+
+        direct = _extract_14_digit_number(text)
+        if direct and has_context:
+            candidates.append({
+                "value": direct,
+                "score": 220 + line["confidence"] * 40,
+                "confidence": line["confidence"],
+                "index": i,
+                "source": line["source"],
+            })
+            continue
+
+        if not has_context:
+            continue
+
+        # Typical printed layout: FSSAI line, then a nearby "No." + number line.
+        for j in nearby_lines(lines, i, max_count=8, max_y_gap=170):
+            other = clean_text(lines[j].get("text", ""))
+            number = _extract_14_digit_number(other)
+            if not number:
+                continue
+
+            other_low = normalize_for_match(other)
+            if re.search(
+                r"\b(phone|mobile|customer|consumer|email|gst|mrp|batch|quantity|weight|pincode)\b",
+                other_low,
+                re.I,
+            ):
+                continue
+
+            d = spatial_distance(line, lines[j])
+            score = (
+                165
+                + line["confidence"] * 25
+                + lines[j]["confidence"] * 55
+                - min(d, 90)
+            )
+            candidates.append({
+                "value": number,
+                "score": score,
+                "confidence": lines[j]["confidence"],
+                "index": j,
+                "source": lines[j]["source"],
+            })
+
+    if not candidates:
+        return None
+
+    groups = _cluster_values(candidates, similarity_threshold=0.90)
+    ranked = []
+    for group in groups:
+        value = _best_group_value(group)
+        if value:
+            number = _extract_14_digit_number(value)
+            if number:
+                ranked.append((_fused_score(group), number))
+
+    ranked.sort(reverse=True, key=lambda x: x[0])
+    return ranked[0][1] if ranked else None
+
+
+# ============================================================
+# FOOD DECLARATIONS: INGREDIENTS / NUTRITION / VEG- NON-VEG
+# ============================================================
+
+def _looks_like_next_declaration(text):
+    """Avoid consuming another package declaration as a section value."""
+    low = normalize_for_match(text)
+    return bool(re.search(
+        r"\b(mrp|batch|lot|net|weight|quantity|packing|"
+        r"use by|expiry|best before|consumer|customer|"
+        r"manufacturer|marketed|fssai|licence|license|"
+        r"email|phone|country of origin)\b",
+        low,
+        re.I,
+    ))
+
+
+def _extract_section_value(lines, labels, max_count=5, max_y_gap=160):
+    """
+    Extract a labeled section from same-line or nearby OCR evidence.
+    Prefers same-line values and otherwise joins nearby non-header lines.
+    """
+    candidates = []
+
+    for i, line in enumerate(lines):
+        text = clean_text(line.get("text", ""))
+        if not text or not has_label(text, labels):
+            continue
+
+        value = remove_label_from_text(text, labels)
+        if value and not _looks_like_next_declaration(value):
+            candidates.append({
+                "value": value,
+                "score": 180 + line["confidence"] * 35,
+                "confidence": line["confidence"],
+                "index": i,
+                "source": line["source"],
+            })
+            continue
+
+        nearby_values = []
+        for j in nearby_lines(
+            lines,
+            i,
+            max_count=max_count,
+            max_y_gap=max_y_gap,
+        ):
+            other = clean_text(lines[j].get("text", ""))
+            if not other or has_label(other, labels):
+                continue
+            if _looks_like_next_declaration(other):
+                continue
+            if re.fullmatch(r"[:;,.|_-]+", other):
+                continue
+
+            nearby_values.append((
+                j,
+                other,
+                lines[j]["confidence"],
+                spatial_distance(line, lines[j]),
+            ))
+
+        if nearby_values:
+            nearby_values.sort(key=lambda x: (x[3], -x[2]))
+            chosen = nearby_values[:3]
+            chosen.sort(key=lambda x: x[0])
+
+            joined = " ".join(item[1] for item in chosen).strip()
+            if joined:
+                avg_conf = sum(item[2] for item in chosen) / len(chosen)
+                min_distance = min(item[3] for item in chosen)
+                candidates.append({
+                    "value": joined,
+                    "score": (
+                        125
+                        + line["confidence"] * 25
+                        + avg_conf * 35
+                        - min(min_distance, 60)
+                    ),
+                    "confidence": avg_conf,
+                    "index": chosen[0][0],
+                    "source": chosen[0][1] and lines[chosen[0][0]]["source"],
+                })
+
+    if not candidates:
+        return None
+
+    groups = _cluster_values(candidates, similarity_threshold=0.78)
+    ranked = []
+
+    for group in groups:
+        value = _best_group_value(group)
+        if value:
+            ranked.append((_fused_score(group), value))
+
+    ranked.sort(reverse=True, key=lambda x: x[0])
+    return ranked[0][1] if ranked else None
+
+
+def extract_ingredients(lines):
+    """Extract the value following an ingredients/ingredient label."""
+    return _extract_section_value(lines, INGREDIENT_LABELS, max_count=4, max_y_gap=140)
+
+
+def extract_nutrition(lines):
+    """Extract nutrition-panel evidence when a nutrition label is present."""
+    return _extract_section_value(lines, NUTRITION_LABELS, max_count=7, max_y_gap=180)
+
+
+def extract_veg_nonveg(lines):
+    """
+    Extract an explicit vegetarian/non-vegetarian declaration.
+    We deliberately do not infer this merely from product type.
+    """
+    explicit = []
+
+    for i, line in enumerate(lines):
+        text = clean_text(line.get("text", ""))
+        low = normalize_for_match(text)
+
+        if not text:
+            continue
+
+        if re.search(r"\bnon[\s-]*vegetarian\b", low, re.I):
+            explicit.append({
+                "value": "Non-Vegetarian",
+                "score": 220 + line["confidence"] * 30,
+                "confidence": line["confidence"],
+                "index": i,
+                "source": line["source"],
+            })
+            continue
+
+        if re.search(r"\bvegetarian\b", low, re.I):
+            explicit.append({
+                "value": "Vegetarian",
+                "score": 220 + line["confidence"] * 30,
+                "confidence": line["confidence"],
+                "index": i,
+                "source": line["source"],
+            })
+            continue
+
+        # Common OCR/label forms such as "VEG" / "NON VEG".
+        if re.search(r"\bnon[\s-]*veg\b", low, re.I):
+            explicit.append({
+                "value": "Non-Vegetarian",
+                "score": 205 + line["confidence"] * 30,
+                "confidence": line["confidence"],
+                "index": i,
+                "source": line["source"],
+            })
+        elif re.search(r"\bveg\b", low, re.I):
+            explicit.append({
+                "value": "Vegetarian",
+                "score": 200 + line["confidence"] * 30,
+                "confidence": line["confidence"],
+                "index": i,
+                "source": line["source"],
+            })
+
+    if not explicit:
+        return None
+
+    explicit.sort(key=lambda x: x["score"], reverse=True)
+    return explicit[0]["value"]
+
+
+# ============================================================
+# MANUFACTURER ADDRESS
+# ============================================================
+
+ADDRESS_HINT_PATTERN = re.compile(
+    r"\b("
+    r"sector|phase|road|street|area|industrial|estate|"
+    r"nagar|plot|block|district|dist\.?|lane|floor|"
+    r"sonipat|haryana|delhi|gurgaon|gurugram|noida|"
+    r"pin|pincode|\d{6}"
+    r")\b",
+    re.I,
+)
+
+
+def _looks_like_address(text):
+    value = clean_text(text)
+    if not value:
+        return False
+
+    low = normalize_for_match(value)
+
+    # Addresses commonly contain locality/address tokens or a 6-digit PIN.
+    if ADDRESS_HINT_PATTERN.search(low):
+        return True
+
+    if re.search(r"\b\d{6}\b", value):
+        return True
+
+    # A line beginning with a plot/house identifier is also useful evidence.
+    return bool(re.match(r"^(?:f[-\s]?\d+|plot|house|h\.?no\.?|no\.?)\b", low))
+
+
+def _clean_address_line(text):
+    value = clean_text(text)
+    value = re.sub(r"^[|:;,.\s]+", "", value)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip(" ,;|-_")
+
+
+def extract_manufacturer_address(lines):
+    """
+    Extract the manufacturer/packer/marketer address from ordered OCR lines.
+
+    The previous version relied too heavily on fuzzy manufacturer labels and
+    spatial proximity. OCR output can lose bounding boxes after evidence
+    fusion, so this version also uses ordered text blocks and explicit
+    address markers such as SECTOR, PHASE, INDUSTRIAL AREA and PIN code.
+    """
+    candidates = []
+
+    def add_candidate(items, anchor_conf=0.8):
+        cleaned_items = []
+        seen = set()
+
+        for item in items:
+            value = _clean_address_line(item.get("text", ""))
+            key = normalize_for_match(value)
+
+            if not value or key in seen:
+                continue
+
+            if _looks_like_address(value):
+                seen.add(key)
+                cleaned_items.append(item)
+
+        if not cleaned_items:
+            return
+
+        # Remove short OCR fragments when a longer address line contains the
+        # same fragment (e.g. "F-2239," + "F-2239, SECTOR 38...").
+        deduped_items = []
+        normalized_items = [
+            (item, normalize_for_match(item.get("text", "")))
+            for item in cleaned_items
+        ]
+
+        for item, normalized in normalized_items:
+            if any(
+                normalized
+                and normalized != other_norm
+                and normalized in other_norm
+                and len(other_norm) > len(normalized) + 4
+                for _, other_norm in normalized_items
+            ):
+                continue
+            deduped_items.append(item)
+
+        cleaned_items = deduped_items or cleaned_items
+
+        joined = ", ".join(
+            _clean_address_line(item.get("text", "")).rstrip(",")
+            for item in cleaned_items
+        )
+
+        if not joined:
+            return
+
+        avg_conf = sum(
+            float(item.get("confidence", 0.0))
+            for item in cleaned_items
+        ) / len(cleaned_items)
+
+        score = (
+            125
+            + anchor_conf * 25
+            + avg_conf * 40
+            + min(len(cleaned_items), 4) * 8
+        )
+
+        if re.search(r"\b\d{6}\b", joined):
+            score += 45
+
+        if len(cleaned_items) >= 3:
+            score += 20
+
+        candidates.append({
+            "value": joined,
+            "score": score,
+            "confidence": avg_conf,
+            "index": cleaned_items[0].get("index", 0),
+            "source": cleaned_items[0].get("source", "unknown"),
+        })
+
+    # Strong manufacturer/packer/marketer anchors. These deliberately include
+    # common OCR-damaged forms such as "ACKED & MARKETED BY".
+    manufacturer_anchor = re.compile(
+        r"\b("
+        r"packed\s*&?\s*marketed\s*by|"
+        r"acked\s*&?\s*marketed\s*by|"
+        r"packed\s+by|"
+        r"marketed\s+by|"
+        r"manufactured\s+by|"
+        r"manufactured\s*&?\s*marketed\s+by|"
+        r"manufactured\s+and\s+marketed\s+by"
+        r")\b",
+        re.I,
+    )
+
+    # First strategy: ordered block after an explicit manufacturer anchor.
+    for i, line in enumerate(lines):
+        text = clean_text(line.get("text", ""))
+        if not text or not manufacturer_anchor.search(text):
+            continue
+
+        block = []
+
+        # Address can start immediately after the manufacturer name, so inspect
+        # the next several ordered OCR lines.
+        for j in range(i + 1, min(i + 10, len(lines))):
+            other = clean_text(lines[j].get("text", ""))
+            if not other:
+                continue
+
+            low = normalize_for_match(other)
+
+            # Once a new declaration begins, stop collecting.
+            if re.search(
+                r"\b(mrp|batch|lot|net|quantity|weight|packing date|"
+                r"use by|expiry|best before|consumer care|customer care|"
+                r"fssai|license|licence|email|phone|feedback|complaints)\b",
+                low,
+                re.I,
+            ):
+                break
+
+            if _looks_like_address(other):
+                block.append(lines[j])
+
+        # Also inspect a few lines before the anchor in case OCR ordering put
+        # the company name between the address and the marketing label.
+        if block:
+            add_candidate(block, anchor_conf=float(line.get("confidence", 0.8)))
+
+    # Second strategy: start from a strong address line and collect adjacent
+    # address lines in OCR reading order. This catches labels where "Address:"
+    # isn't explicitly printed.
+    for i, line in enumerate(lines):
+        text = clean_text(line.get("text", ""))
+        if not _looks_like_address(text):
+            continue
+
+        block = [line]
+
+        # Look forward.
+        for j in range(i + 1, min(i + 5, len(lines))):
+            other = clean_text(lines[j].get("text", ""))
+            if not other:
+                continue
+
+            if re.search(
+                r"\b(mrp|batch|lot|net|quantity|weight|packing date|"
+                r"use by|expiry|best before|consumer care|customer care|"
+                r"fssai|license|licence|email|phone)\b",
+                normalize_for_match(other),
+                re.I,
+            ):
+                break
+
+            if _looks_like_address(other):
+                block.append(lines[j])
+
+        # Only accept fallback blocks that have substantial address evidence.
+        joined = " ".join(_clean_address_line(x.get("text", "")) for x in block)
+        strong_markers = len(
+            re.findall(
+                r"\b(sector|phase|road|street|area|industrial|estate|"
+                r"nagar|plot|block|district|sonipat|haryana|"
+                r"pin|pincode)\b",
+                normalize_for_match(joined),
+                re.I,
+            )
+        )
+        has_pin = bool(re.search(r"\b\d{6}\b", joined))
+
+        if strong_markers >= 2 or has_pin:
+            add_candidate(block, anchor_conf=0.75)
+
+    if not candidates:
+        return None
+
+    groups = _cluster_values(candidates, similarity_threshold=0.72)
+    ranked = []
+
+    for group in groups:
+        value = _best_group_value(group)
+        if not value:
+            continue
+
+        score = _fused_score(group)
+
+        if re.search(r"\b\d{6}\b", value):
+            score += 30
+
+        if len(value.split()) >= 6:
+            score += 20
+
+        # Prefer addresses containing locality + state + PIN, which are much
+        # stronger than a single "F-2239" fragment.
+        locality_state_pin = (
+            re.search(r"\bsonipat\b", value, re.I)
+            and re.search(r"\bharyana\b", value, re.I)
+            and re.search(r"\b\d{6}\b", value)
+        )
+        if locality_state_pin:
+            score += 60
+
+        ranked.append((score, value))
+
+    ranked.sort(reverse=True, key=lambda item: item[0])
+    return ranked[0][1] if ranked else None
+
+
+# ============================================================
 # RAW EVIDENCE / DEBUG SUPPORT
 # ============================================================
 
@@ -2030,6 +2576,11 @@ def extract_fields(ocr_results):
         "expiry_date": expiry_date,
         "best_before": best_before,
         "consumer_care": extract_consumer_care(lines),
+        "fssai_license_number": extract_fssai_license_number(lines),
+        "ingredients": extract_ingredients(lines),
+        "nutrition": extract_nutrition(lines),
+        "veg_nonveg": extract_veg_nonveg(lines),
+        "manufacturer_address": extract_manufacturer_address(lines),
         "country_of_origin": extract_country(lines),
         "batch_number": extract_batch(lines),
         "raw_text": [line["text"] for line in lines],

@@ -1,9 +1,33 @@
+# Python
 __pycache__/
-*.pyc
-*.png
-*.jpg
-*.jpeg
+*.py[cod]
+*.pyo
+
+# Virtual environment
 venv/
 .venv/
-.env
+env/
+
+# Streamlit
 .streamlit/secrets.toml
+
+# Environment / secrets
+.env
+*.env
+
+# Local database
+data/*.db
+*.db
+
+# Uploaded/generated files
+uploads/
+outputs/
+cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
